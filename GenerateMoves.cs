@@ -1281,5 +1281,121 @@ namespace PromethiusEngine
 
             return legal;
         }
+
+        // ----------------------- Public helper utilities -----------------------
+
+        // Return only legal capture moves for the current position
+        public static List<Board.Move> GenerateCaptures(Board board)
+        {
+            var captures = new List<Board.Move>();
+            Span<Board.Move> span = stackalloc Board.Move[218];
+            GenerateMovesSpan(board, span, out int count);
+            for (int i = 0; i < count; i++)
+            {
+                int mv = (int)span[i];
+                if (((mv >> 17) & 1) != 0) captures.Add(span[i]);
+            }
+            return captures;
+        }
+
+        // Is the side to move currently in check?
+        public static bool IsInCheck(Board board)
+        {
+            int stm = board.SideToMove;
+            int kingSq = (stm == Board.White) ? board.WhiteKingSquare : board.BlackKingSquare;
+            int opp = stm == Board.White ? Board.Black : Board.White;
+            return IsSquareAttacked(board, kingSq, opp);
+        }
+
+        // Quick helper: are there any legal moves available?
+        public static bool HasLegalMoves(Board board)
+        {
+            Span<Board.Move> span = stackalloc Board.Move[218];
+            GenerateMovesSpan(board, span, out int count);
+            return count > 0;
+        }
+
+        public static bool IsInCheckmate(Board board)
+        {
+            return IsInCheck(board) && !HasLegalMoves(board);
+        }
+
+        public static bool IsInStalemate(Board board)
+        {
+            return !IsInCheck(board) && !HasLegalMoves(board);
+        }
+
+        // Fifty-move rule: 50 full moves = 100 half-moves
+        public static bool IsFiftyMoveDraw(Board board)
+        {
+            return board.HalfmoveClock >= 100;
+        }
+
+        // Basic insufficient material check (covers most common draw cases):
+        // - King vs King
+        // - King vs King + (single) minor piece (B or N)
+        // - King + bishop vs King + bishop where both bishops are on same color
+        // This is conservative and intended as a fast heuristic.
+        public static bool IsInsufficientMaterial(Board board)
+        {
+            var squares = board.Squares;
+            int pawnCount = 0;
+            int majorCount = 0; // rooks/queens
+            int minorCount = 0; // bishops/knights
+            var bishopSquares = new System.Collections.Generic.List<int>();
+
+            for (int s = 0; s < 128; s++)
+            {
+                if ((s & 0x88) != 0) continue;
+                sbyte p = squares[s];
+                if (p == Board.Empty) continue;
+                int ptype = (p > 6) ? p - 6 : p;
+                switch (ptype)
+                {
+                    case Board.Pawn: pawnCount++; break;
+                    case Board.Rook:
+                    case Board.Queen: majorCount++; break;
+                    case Board.Bishop: minorCount++; bishopSquares.Add(s); break;
+                    case Board.Knight: minorCount++; break;
+                }
+            }
+
+            if (pawnCount > 0 || majorCount > 0) return false;
+
+            if (minorCount == 0) return true; // K vs K
+            if (minorCount == 1) return true; // single minor piece
+            if (minorCount == 2 && bishopSquares.Count == 2)
+            {
+                // if both bishops are on same color, mate is impossible
+                int c0 = ((bishopSquares[0] & 0xF) + (bishopSquares[0] >> 4)) & 1;
+                int c1 = ((bishopSquares[1] & 0xF) + (bishopSquares[1] >> 4)) & 1;
+                if (c0 == c1) return true;
+            }
+
+            return false;
+        }
+
+        // Repetition detection: caller must provide a list of historic Zobrist keys (older to newer).
+        // This function counts occurrences of the current board key in the provided history and
+        // returns true if occurrences (including the current position) >= neededOccurrences.
+        public static bool IsRepeatedPosition(Board board, System.Collections.Generic.IReadOnlyList<ulong> history, int neededOccurrences = 3)
+        {
+            if (history == null) return false;
+            ulong key = board.ZobristKey;
+            int count = 0;
+            foreach (var h in history) if (h == key) count++;
+            // include the current position as an occurrence
+            return (count + 1) >= neededOccurrences;
+        }
+
+        // Aggregate draw test: checks stalemate, fifty-move, insufficient material and repetition (if history provided)
+        public static bool IsDraw(Board board, System.Collections.Generic.IReadOnlyList<ulong>? history = null)
+        {
+            if (IsInsufficientMaterial(board)) return true;
+            if (IsFiftyMoveDraw(board)) return true;
+            if (history != null && IsRepeatedPosition(board, history)) return true;
+            if (IsInStalemate(board)) return true;
+            return false;
+        }
     }
 }
