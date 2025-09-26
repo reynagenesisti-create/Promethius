@@ -1,0 +1,33 @@
+# Build outputs
+bin/
+obj/
+
+# Rider / Visual Studio
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+
+# Visual Studio Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# NuGet
+*.nupkg
+*.snupkg
+
+# Dotnet publish
+publish/
+
+# other
+*.tmp
+*.cache
+
+# Ignore the opening book games in release folder if present
+bin/Release/**/Games.txt
