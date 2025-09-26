@@ -11,7 +11,11 @@ Features
 - Perft and perft divide utilities
 - UCI interface for connecting to GUIs
 - Opening book support (simple random book move chooser)
-- Stubbed search API to wire into UCI (`Search.SearchBestMove` returns a random legal move for now)
+- Helper utilities added to `MoveGenerator` (GenerateCaptures, IsInCheck, IsInCheckmate, IsInStalemate,
+	IsFiftyMoveDraw, IsInsufficientMaterial, IsRepeatedPosition, IsDraw, HasLegalMoves)
+- Simple negamax search implemented in `Search.SearchBestMove` (depth-limited, no alpha-beta)
+	and a material-only evaluator in `Evaluate.EvaluateMaterial` (pawn=100, knight=320, bishop=330,
+	rook=500, queen=900). These provide a minimal but working search path (mate/draw detection included).
 
 Building
 
