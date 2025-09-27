@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using System.Diagnostics;
+using System.Threading.Tasks;
 
 namespace PromethiusEngine
 {
@@ -21,6 +22,8 @@ namespace PromethiusEngine
         private Board _board = new Board();
         private Dictionary<string, string> _options = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private bool _bookActive = true;
+        // Track current background search task so Stop can request cancellation
+        private Task? _searchTask = null;
 
         public UciEngine()
         {
@@ -331,21 +334,44 @@ namespace PromethiusEngine
 
             Console.Error.WriteLine($"[Promethius] time alloc: {allocMs}ms, thinking for {thinkMs}ms (sideToMove={_board.SideToMove})");
 
-            int maxDepth = 20;
-            var best = Search.SearchBestMove(_board, maxDepth, thinkMs);
-
-            if ((int)best == 0)
+            int maxDepth = 30;
+            // Run search asynchronously so the UCI main loop can process 'stop'
+            Search.ClearStop();
+            // copy board by FEN so the search can run without locking the main board
+            var boardForSearch = new Board();
+            boardForSearch.LoadFEN(_board.ToFEN());
+            _searchTask = Task.Run(() =>
             {
-                Console.WriteLine("bestmove 0000");
-            }
-            else
-            {
-                Console.WriteLine("bestmove " + MoveToUci(best));
-            }
+                try
+                {
+                    var best = Search.SearchBestMove(boardForSearch, maxDepth, thinkMs);
+                    if ((int)best == 0) Console.WriteLine("bestmove 0000");
+                    else Console.WriteLine("bestmove " + MoveToUci(best));
+                }
+                catch (OperationCanceledException)
+                {
+                    // Search was cancelled: best move may have been printed earlier or none available
+                    Console.Error.WriteLine("[Promethius] search cancelled");
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Promethius] search exception: {ex.Message}");
+                }
+            });
         }
 
 
-        private void HandleStop() { }
+        private void HandleStop()
+        {
+            Console.Error.WriteLine("[Promethius] stop requested");
+            Search.RequestStop();
+            try
+            {
+                // wait briefly for search task to acknowledge stop
+                if (_searchTask != null) _searchTask.Wait(500);
+            }
+            catch (AggregateException) { }
+        }
         private void HandlePonderHit() { }
         private void HandleQuit() { _isRunning = false; }
         private void HandleDebug(string line) { Console.Error.WriteLine($"[Promethius] debug: {line}"); }
