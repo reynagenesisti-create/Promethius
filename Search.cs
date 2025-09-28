@@ -136,7 +136,7 @@ namespace PromethiusEngine
 
         // Build a principal variation-aware negamax (returns score and PV as a list of moves).
         // This is more expensive than the pure score-only Negamax but allows printing PV.
-        private static (int score, List<Board.Move> pv) NegamaxWithPv(Board board, int depth, int alpha, int beta)
+        private static (int score, List<Board.Move>? pv) NegamaxWithPv(Board board, int depth, int alpha, int beta)
         {
             CheckStop();
 
@@ -153,11 +153,37 @@ namespace PromethiusEngine
             Span<Board.Move> moves = stackalloc Board.Move[218];
             MoveGenerator.GenerateMovesSpan(board, moves, out int movesCount);
 
-            // probe transposition table for best move to try first
+            // capture original window for TT-store decisions later
+            int origAlpha = alpha;
+            int origBeta = beta;
+
+            // probe transposition table for best move to try first and for usable bounds
             int ttMoveInt = 0;
             if (TranspositionTable.Probe(board.ZobristKey, out int ttValue, out int ttDepth, out int ttMove, out byte ttFlags))
             {
                 ttMoveInt = ttMove;
+                // If the TT entry is from a search at least as deep, it may provide a usable bound
+                if (ttDepth >= depth)
+                {
+                    if (ttFlags == TranspositionTable.FlagExact)
+                    {
+                        // exact value from table -> return immediately
+                        return (ttValue, new List<Board.Move>());
+                    }
+                    if (ttFlags == TranspositionTable.FlagLower && ttValue >= beta)
+                    {
+                        // tt lower bound causes a fail-high
+                        return (ttValue, new List<Board.Move>());
+                    }
+                    if (ttFlags == TranspositionTable.FlagUpper && ttValue <= alpha)
+                    {
+                        // tt upper bound causes a fail-low
+                        return (ttValue, new List<Board.Move>());
+                    }
+                    // otherwise we can tighten the window
+                    if (ttFlags == TranspositionTable.FlagLower) alpha = Math.Max(alpha, ttValue);
+                    else if (ttFlags == TranspositionTable.FlagUpper) beta = Math.Min(beta, ttValue);
+                }
             }
 
             // Order moves in-place into a small array of pairs (move, score)
@@ -179,7 +205,7 @@ namespace PromethiusEngine
                 Board.Move mv = ordered[i].move;
                 board.MakeMoveWithUndo(mv, out var undo);
                 int val;
-                List<Board.Move> childPv;
+                List<Board.Move>? childPv;
                 try
                 {
                     var child = NegamaxWithPv(board, depth - 1, -beta, -alpha);
@@ -219,12 +245,19 @@ namespace PromethiusEngine
                         s_history[mvInt] = h + (depth * depth);
                     }
 
-                    // store to transposition table as lower bound
+                    // store to transposition table as lower bound (beta-cutoff)
                     TranspositionTable.Store(board.ZobristKey, best, depth, TranspositionTable.FlagLower, (int)mv);
 
                     break;
                 }
             }
+
+            // store final result in TT with correct flag
+            byte storeFlag = TranspositionTable.FlagExact;
+            if (best <= origAlpha) storeFlag = TranspositionTable.FlagUpper;
+            else if (best >= origBeta) storeFlag = TranspositionTable.FlagLower;
+            int storeMove = (bestPv != null && bestPv.Count > 0) ? (int)bestPv[0] : 0;
+            TranspositionTable.Store(board.ZobristKey, best, depth, storeFlag, storeMove);
 
             return (best, bestPv);
         }
@@ -323,13 +356,39 @@ namespace PromethiusEngine
                 return 0; // stalemate -> draw
             }
 
+
             int best = int.MinValue + 1024;
 
-            // probe TT for ordering
+            // capture original window for TT-store decisions later
+            int origAlpha = alpha;
+            int origBeta = beta;
+
+            // probe TT for ordering and usable bounds
             int ttMoveInt = 0;
-            if (TranspositionTable.Probe(board.ZobristKey, out int ttValue, out int ttDepth, out int ttMove, out byte ttFlags)) ttMoveInt = ttMove;
+            if (TranspositionTable.Probe(board.ZobristKey, out int ttValue, out int ttDepth, out int ttMove, out byte ttFlags))
+            {
+                ttMoveInt = ttMove;
+                if (ttDepth >= depth)
+                {
+                    if (ttFlags == TranspositionTable.FlagExact)
+                    {
+                        return ttValue;
+                    }
+                    if (ttFlags == TranspositionTable.FlagLower && ttValue >= beta)
+                    {
+                        return ttValue;
+                    }
+                    if (ttFlags == TranspositionTable.FlagUpper && ttValue <= alpha)
+                    {
+                        return ttValue;
+                    }
+                    if (ttFlags == TranspositionTable.FlagLower) alpha = Math.Max(alpha, ttValue);
+                    else if (ttFlags == TranspositionTable.FlagUpper) beta = Math.Min(beta, ttValue);
+                }
+            }
 
             var ordered = OrderMoves(moves.Slice(0, movesCount), board, ttMoveInt, depth);
+            int bestMoveInt = 0;
 
             for (int i = 0; i < ordered.Length; i++)
             {
@@ -369,10 +428,17 @@ namespace PromethiusEngine
 
                     // TT store lower bound
                     TranspositionTable.Store(board.ZobristKey, best, depth, TranspositionTable.FlagLower, (int)mv);
+                    bestMoveInt = (int)mv;
 
                     break;
                 }
             }
+
+            // store final result in TT with appropriate flag
+            byte storeFlag = TranspositionTable.FlagExact;
+            if (best <= origAlpha) storeFlag = TranspositionTable.FlagUpper;
+            else if (best >= origBeta) storeFlag = TranspositionTable.FlagLower;
+            TranspositionTable.Store(board.ZobristKey, best, depth, storeFlag, bestMoveInt);
 
             return best;
         }
