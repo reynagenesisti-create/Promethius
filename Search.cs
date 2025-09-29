@@ -37,6 +37,18 @@ namespace PromethiusEngine
         // MVV-LVA table: victim (1..6) x attacker (1..6) -> score
         private static readonly int[,] MvvLva = new int[7, 7];
 
+        // Pruning/tuning parameters
+        private const int FUTILITY_MAX_DEPTH = 3; // apply futility at shallow depths
+        private const int FUTILITY_MARGIN_BASE = 100; // margin per ply (centipawns)
+
+        // Multi-cut parameters (tactical shortcut): when many quiet moves exist,
+        // try several reduced, null-window searches on the first few moves. If
+        // enough of them cause cutoffs, assume a beta-cut is likely and cutoff.
+        private const int MULTICUT_MIN_DEPTH = 3;
+        private const int MULTICUT_TEST_MOVES = 3;
+        private const int MULTICUT_REQUIRED_CUTOFFS = 2;
+        private const int MULTICUT_REDUCTION = 2; // reduced plies for multi-cut test
+
         static Search()
         {
             // fill MVV-LVA: higher victim value and lower attacker value -> higher score
@@ -238,15 +250,62 @@ namespace PromethiusEngine
                 }
             }
 
+            // Multi-cut pruning: for tactical positions with many quiet moves, try a few
+            // reduced null-window searches; if enough of them cause beta-cutoffs,
+            // assume a cutoff and return beta early. This is heuristic.
+            if (depth >= MULTICUT_MIN_DEPTH)
+            {
+                int tests = 0;
+                int cutoffs = 0;
+                for (int mi = 0; mi < ordered.Length && tests < MULTICUT_TEST_MOVES; mi++)
+                {
+                    int mvInt = (int)ordered[mi].move;
+                    bool isCapture = ((mvInt >> 17) & 1) != 0;
+                    int promo = (mvInt >> 14) & 7;
+                    if (isCapture || promo != 0) continue; // only quiet moves
+                    // test this move with a reduced, null-window search
+                    board.MakeMoveWithUndo(ordered[mi].move, out var tmpUndo);
+                    try
+                    {
+                        int testDepth = Math.Max(0, depth - 1 - MULTICUT_REDUCTION);
+                        int score = -Negamax(board, testDepth, -beta, -beta + 1, ply + 1, false);
+                        if (score >= beta) cutoffs++;
+                    }
+                    finally { board.UnmakeMove(ordered[mi].move, tmpUndo); }
+                    tests++;
+                    if (cutoffs >= MULTICUT_REQUIRED_CUTOFFS)
+                    {
+                        // multi-cut succeeded: store lower bound and return beta
+                        TranspositionTable.Store(board.ZobristKey, beta, depth, TranspositionTable.FlagLower, 0);
+                        return (beta, new List<Board.Move>());
+                    }
+                }
+            }
+
             int best = int.MinValue + 1024;
             List<Board.Move> bestPv = new List<Board.Move>();
 
             for (int i = 0; i < ordered.Length; i++)
             {
                 CheckStop();
-
                 Board.Move mv = ordered[i].move;
                 int mvIntLocal = (int)mv;
+
+                // Futility pruning: at shallow depths, skip quiet moves that are unlikely to raise
+                // the alpha bound. We check parent position (before making the move).
+                bool isCaptureLocalPre = ((mvIntLocal >> 17) & 1) != 0;
+                int promoLocalPre = (mvIntLocal >> 14) & 7;
+                if (depth <= FUTILITY_MAX_DEPTH && !isCaptureLocalPre && promoLocalPre == 0 && !MoveGenerator.IsInCheck(board))
+                {
+                    int standPat = EvaluateLeaf(board);
+                    int margin = FUTILITY_MARGIN_BASE * depth;
+                    if (standPat + margin <= alpha)
+                    {
+                        // prune this quiet move as fail-low
+                        continue;
+                    }
+                }
+
                 board.MakeMoveWithUndo(mv, out var undo);
                 int val;
                 List<Board.Move>? childPv = null;
@@ -470,11 +529,52 @@ namespace PromethiusEngine
 
             var ordered = OrderMoves(moves.Slice(0, movesCount), board, ttMoveInt, depth);
 
+            // Multi-cut pruning (score-only): same heuristic as in PV-search
+            if (depth >= MULTICUT_MIN_DEPTH)
+            {
+                int tests = 0; int cutoffs = 0;
+                for (int mi = 0; mi < ordered.Length && tests < MULTICUT_TEST_MOVES; mi++)
+                {
+                    int mvInt = (int)ordered[mi].move;
+                    bool isCapture = ((mvInt >> 17) & 1) != 0;
+                    int promo = (mvInt >> 14) & 7;
+                    if (isCapture || promo != 0) continue;
+                    board.MakeMoveWithUndo(ordered[mi].move, out var tmpUndo);
+                    try
+                    {
+                        int testDepth = Math.Max(0, depth - 1 - MULTICUT_REDUCTION);
+                        int score = -Negamax(board, testDepth, -beta, -beta + 1, ply + 1, false);
+                        if (score >= beta) cutoffs++;
+                    }
+                    finally { board.UnmakeMove(ordered[mi].move, tmpUndo); }
+                    tests++;
+                    if (cutoffs >= MULTICUT_REQUIRED_CUTOFFS)
+                    {
+                        TranspositionTable.Store(board.ZobristKey, beta, depth, TranspositionTable.FlagLower, 0);
+                        return beta;
+                    }
+                }
+            }
+
             for (int i = 0; i < ordered.Length; i++)
             {
                 CheckStop();
                 Board.Move mv = ordered[i].move;
                 int mvIntLocal = (int)mv;
+
+                // Futility pruning at shallow depths for quiet moves
+                bool isCapturePre = ((mvIntLocal >> 17) & 1) != 0;
+                int promoPre = (mvIntLocal >> 14) & 7;
+                if (depth <= FUTILITY_MAX_DEPTH && !isCapturePre && promoPre == 0 && !MoveGenerator.IsInCheck(board))
+                {
+                    int standPat = EvaluateLeaf(board);
+                    int margin = FUTILITY_MARGIN_BASE * depth;
+                    if (standPat + margin <= alpha)
+                    {
+                        continue; // prune quiet move
+                    }
+                }
+
                 board.MakeMoveWithUndo(mv, out var undo);
                 int val;
                 try
