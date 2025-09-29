@@ -28,6 +28,16 @@ namespace PromethiusEngine
         private const int MATE_SCORE = 1000000;
         private const int MAX_SCORE = 2000000;
 
+        // piece values for SEE / ordering (centipawns)
+        private static readonly int[] PieceValue = { 0, 100, 320, 330, 500, 900, 20000 };
+
+        // 0x88 deltas for attack detection
+        private static readonly int[] KnightDeltas = { 0x21, 0x1f, 0x12, 0x0e, -0x21, -0x1f, -0x12, -0x0e };
+        private static readonly int[] KingDeltas = { 0x10, 0x11, 0x01, -0x0f, -0x10, -0x11, -0x01, 0x0f };
+        private static readonly int[] BishopDeltas = { 0x11, 0x0f, -0x11, -0x0f };
+        private static readonly int[] RookDeltas = { 0x10, 0x01, -0x10, -0x01 };
+        private static readonly int[] QueenDeltas = { 0x10, 0x11, 0x01, 0x0f, -0x10, -0x11, -0x01, -0x0f };
+
         public static void ClearStop()
         {
             s_stopRequested = false;
@@ -136,7 +146,7 @@ namespace PromethiusEngine
 
         // Build a principal variation-aware negamax (returns score and PV as a list of moves).
         // This is more expensive than the pure score-only Negamax but allows printing PV.
-        private static (int score, List<Board.Move>? pv) NegamaxWithPv(Board board, int depth, int alpha, int beta)
+        private static (int score, List<Board.Move> pv) NegamaxWithPv(Board board, int depth, int alpha, int beta)
         {
             CheckStop();
 
@@ -153,37 +163,11 @@ namespace PromethiusEngine
             Span<Board.Move> moves = stackalloc Board.Move[218];
             MoveGenerator.GenerateMovesSpan(board, moves, out int movesCount);
 
-            // capture original window for TT-store decisions later
-            int origAlpha = alpha;
-            int origBeta = beta;
-
-            // probe transposition table for best move to try first and for usable bounds
+            // probe transposition table for best move to try first
             int ttMoveInt = 0;
             if (TranspositionTable.Probe(board.ZobristKey, out int ttValue, out int ttDepth, out int ttMove, out byte ttFlags))
             {
                 ttMoveInt = ttMove;
-                // If the TT entry is from a search at least as deep, it may provide a usable bound
-                if (ttDepth >= depth)
-                {
-                    if (ttFlags == TranspositionTable.FlagExact)
-                    {
-                        // exact value from table -> return immediately
-                        return (ttValue, new List<Board.Move>());
-                    }
-                    if (ttFlags == TranspositionTable.FlagLower && ttValue >= beta)
-                    {
-                        // tt lower bound causes a fail-high
-                        return (ttValue, new List<Board.Move>());
-                    }
-                    if (ttFlags == TranspositionTable.FlagUpper && ttValue <= alpha)
-                    {
-                        // tt upper bound causes a fail-low
-                        return (ttValue, new List<Board.Move>());
-                    }
-                    // otherwise we can tighten the window
-                    if (ttFlags == TranspositionTable.FlagLower) alpha = Math.Max(alpha, ttValue);
-                    else if (ttFlags == TranspositionTable.FlagUpper) beta = Math.Min(beta, ttValue);
-                }
             }
 
             // Order moves in-place into a small array of pairs (move, score)
@@ -205,7 +189,7 @@ namespace PromethiusEngine
                 Board.Move mv = ordered[i].move;
                 board.MakeMoveWithUndo(mv, out var undo);
                 int val;
-                List<Board.Move>? childPv;
+                List<Board.Move> childPv;
                 try
                 {
                     var child = NegamaxWithPv(board, depth - 1, -beta, -alpha);
@@ -245,19 +229,12 @@ namespace PromethiusEngine
                         s_history[mvInt] = h + (depth * depth);
                     }
 
-                    // store to transposition table as lower bound (beta-cutoff)
+                    // store to transposition table as lower bound
                     TranspositionTable.Store(board.ZobristKey, best, depth, TranspositionTable.FlagLower, (int)mv);
 
                     break;
                 }
             }
-
-            // store final result in TT with correct flag
-            byte storeFlag = TranspositionTable.FlagExact;
-            if (best <= origAlpha) storeFlag = TranspositionTable.FlagUpper;
-            else if (best >= origBeta) storeFlag = TranspositionTable.FlagLower;
-            int storeMove = (bestPv != null && bestPv.Count > 0) ? (int)bestPv[0] : 0;
-            TranspositionTable.Store(board.ZobristKey, best, depth, storeFlag, storeMove);
 
             return (best, bestPv);
         }
@@ -291,6 +268,9 @@ namespace PromethiusEngine
                     switch (attType) { case Board.Pawn: AttVal = 100; break; case Board.Knight: AttVal = 320; break; case Board.Bishop: AttVal = 330; break; case Board.Rook: AttVal = 500; break; case Board.Queen: AttVal = 900; break; case Board.King: AttVal = 20000; break; }
                     // MVV-LVA style: prefer capturing more valuable victim with less valuable attacker
                     score += 600000 + (VictVal * 10 - AttVal);
+                    // Static Exchange Evaluation: if this capture loses material overall, demote it
+                    int see = StaticExchangeEvaluation(board, from, to);
+                    if (see < 0) score -= 400000; // demote losing captures
                 }
                 // killer moves
                 for (int k = 0; k < 2; k++) if (s_killers[depth < 128 ? depth : 127, k] == mvInt) score += 200000;
@@ -356,39 +336,13 @@ namespace PromethiusEngine
                 return 0; // stalemate -> draw
             }
 
-
             int best = int.MinValue + 1024;
 
-            // capture original window for TT-store decisions later
-            int origAlpha = alpha;
-            int origBeta = beta;
-
-            // probe TT for ordering and usable bounds
+            // probe TT for ordering
             int ttMoveInt = 0;
-            if (TranspositionTable.Probe(board.ZobristKey, out int ttValue, out int ttDepth, out int ttMove, out byte ttFlags))
-            {
-                ttMoveInt = ttMove;
-                if (ttDepth >= depth)
-                {
-                    if (ttFlags == TranspositionTable.FlagExact)
-                    {
-                        return ttValue;
-                    }
-                    if (ttFlags == TranspositionTable.FlagLower && ttValue >= beta)
-                    {
-                        return ttValue;
-                    }
-                    if (ttFlags == TranspositionTable.FlagUpper && ttValue <= alpha)
-                    {
-                        return ttValue;
-                    }
-                    if (ttFlags == TranspositionTable.FlagLower) alpha = Math.Max(alpha, ttValue);
-                    else if (ttFlags == TranspositionTable.FlagUpper) beta = Math.Min(beta, ttValue);
-                }
-            }
+            if (TranspositionTable.Probe(board.ZobristKey, out int ttValue, out int ttDepth, out int ttMove, out byte ttFlags)) ttMoveInt = ttMove;
 
             var ordered = OrderMoves(moves.Slice(0, movesCount), board, ttMoveInt, depth);
-            int bestMoveInt = 0;
 
             for (int i = 0; i < ordered.Length; i++)
             {
@@ -428,17 +382,10 @@ namespace PromethiusEngine
 
                     // TT store lower bound
                     TranspositionTable.Store(board.ZobristKey, best, depth, TranspositionTable.FlagLower, (int)mv);
-                    bestMoveInt = (int)mv;
 
                     break;
                 }
             }
-
-            // store final result in TT with appropriate flag
-            byte storeFlag = TranspositionTable.FlagExact;
-            if (best <= origAlpha) storeFlag = TranspositionTable.FlagUpper;
-            else if (best >= origBeta) storeFlag = TranspositionTable.FlagLower;
-            TranspositionTable.Store(board.ZobristKey, best, depth, storeFlag, bestMoveInt);
 
             return best;
         }
@@ -498,6 +445,12 @@ namespace PromethiusEngine
 
                 Board.Move mv = orderedCaps[i].move;
 
+                // Quick SEE filter: skip obviously bad recaptures
+                int from = Board.Move.GetFrom(mv);
+                int to = Board.Move.GetTo(mv);
+                int seeVal = StaticExchangeEvaluation(board, from, to);
+                if (seeVal + alpha < 0) continue; // likely losing capture -> skip
+
                 // make move
                 board.MakeMoveWithUndo(mv, out var undo);
                 int score;
@@ -516,6 +469,187 @@ namespace PromethiusEngine
             }
 
             return alpha;
+        }
+
+        // Return whether square 'sq' is attacked by side 'attackerColor' on given board.
+        private static bool IsSquareAttackedBy(Board board, int sq, int attackerColor)
+        {
+            var squares = board.Squares;
+            // pawns
+            if (attackerColor == Board.White)
+            {
+                int a1 = sq - 15; if ((a1 & 0x88) == 0 && squares[a1] == Board.Pawn) return true;
+                int a2 = sq - 17; if ((a2 & 0x88) == 0 && squares[a2] == Board.Pawn) return true;
+            }
+            else
+            {
+                int a1 = sq + 15; if ((a1 & 0x88) == 0 && squares[a1] == (sbyte)(Board.Pawn + 6)) return true;
+                int a2 = sq + 17; if ((a2 & 0x88) == 0 && squares[a2] == (sbyte)(Board.Pawn + 6)) return true;
+            }
+
+            // knights
+            foreach (var d in KnightDeltas) { int s = sq + d; if ((s & 0x88) == 0) { var p = squares[s]; if (p != Board.Empty) { int pt = p > 6 ? p - 6 : p; int col = p > 6 ? Board.Black : Board.White; if (pt == Board.Knight && col == attackerColor) return true; } } }
+
+            // king
+            foreach (var d in KingDeltas) { int s = sq + d; if ((s & 0x88) == 0) { var p = squares[s]; if (p != Board.Empty) { int pt = p > 6 ? p - 6 : p; int col = p > 6 ? Board.Black : Board.White; if (pt == Board.King && col == attackerColor) return true; } } }
+
+            // sliding pieces: bishops/queens (diagonals), rooks/queens (orth)
+            foreach (var d in BishopDeltas)
+            {
+                int t = sq + d;
+                while ((t & 0x88) == 0)
+                {
+                    var p = squares[t];
+                    if (p != Board.Empty)
+                    {
+                        int pt = p > 6 ? p - 6 : p; int col = p > 6 ? Board.Black : Board.White;
+                        if (col == attackerColor && (pt == Board.Bishop || pt == Board.Queen)) return true;
+                        break;
+                    }
+                    t += d;
+                }
+            }
+            foreach (var d in RookDeltas)
+            {
+                int t = sq + d;
+                while ((t & 0x88) == 0)
+                {
+                    var p = squares[t];
+                    if (p != Board.Empty)
+                    {
+                        int pt = p > 6 ? p - 6 : p; int col = p > 6 ? Board.Black : Board.White;
+                        if (col == attackerColor && (pt == Board.Rook || pt == Board.Queen)) return true;
+                        break;
+                    }
+                    t += d;
+                }
+            }
+
+            return false;
+        }
+
+        // Find the least valuable attacker of 'sq' for the given side; returns square of attacker or -1
+        // occupiedMask is a Span<byte> (0/1) indicating presence of a piece on each square; this avoids heap allocations.
+        private static int FindLeastValuableAttacker(Board board, int sq, int attackerColor, Span<byte> occupiedMask)
+        {
+            var squares = board.Squares;
+            int bestSq = -1; int bestVal = int.MaxValue;
+            // pawns - very common, check first and return immediately if found
+            if (attackerColor == Board.White)
+            {
+                int s1 = sq - 15; if ((s1 & 0x88) == 0 && occupiedMask[s1] != 0 && squares[s1] == Board.Pawn) return s1;
+                int s2 = sq - 17; if ((s2 & 0x88) == 0 && occupiedMask[s2] != 0 && squares[s2] == Board.Pawn) return s2;
+            }
+            else
+            {
+                int s1 = sq + 15; if ((s1 & 0x88) == 0 && occupiedMask[s1] != 0 && squares[s1] == (sbyte)(Board.Pawn + 6)) return s1;
+                int s2 = sq + 17; if ((s2 & 0x88) == 0 && occupiedMask[s2] != 0 && squares[s2] == (sbyte)(Board.Pawn + 6)) return s2;
+            }
+
+            // knights - inline unrolled checks (common and cheap)
+            int s;
+            s = sq + KnightDeltas[0]; if ((s & 0x88) == 0 && occupiedMask[s] != 0) { var p = squares[s]; if (p != Board.Empty) { int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p; if (col == attackerColor && pt == Board.Knight) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = s; } } } }
+            s = sq + KnightDeltas[1]; if ((s & 0x88) == 0 && occupiedMask[s] != 0) { var p = squares[s]; if (p != Board.Empty) { int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p; if (col == attackerColor && pt == Board.Knight) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = s; } } } }
+            s = sq + KnightDeltas[2]; if ((s & 0x88) == 0 && occupiedMask[s] != 0) { var p = squares[s]; if (p != Board.Empty) { int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p; if (col == attackerColor && pt == Board.Knight) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = s; } } } }
+            s = sq + KnightDeltas[3]; if ((s & 0x88) == 0 && occupiedMask[s] != 0) { var p = squares[s]; if (p != Board.Empty) { int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p; if (col == attackerColor && pt == Board.Knight) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = s; } } } }
+            s = sq + KnightDeltas[4]; if ((s & 0x88) == 0 && occupiedMask[s] != 0) { var p = squares[s]; if (p != Board.Empty) { int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p; if (col == attackerColor && pt == Board.Knight) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = s; } } } }
+            s = sq + KnightDeltas[5]; if ((s & 0x88) == 0 && occupiedMask[s] != 0) { var p = squares[s]; if (p != Board.Empty) { int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p; if (col == attackerColor && pt == Board.Knight) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = s; } } } }
+            s = sq + KnightDeltas[6]; if ((s & 0x88) == 0 && occupiedMask[s] != 0) { var p = squares[s]; if (p != Board.Empty) { int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p; if (col == attackerColor && pt == Board.Knight) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = s; } } } }
+            s = sq + KnightDeltas[7]; if ((s & 0x88) == 0 && occupiedMask[s] != 0) { var p = squares[s]; if (p != Board.Empty) { int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p; if (col == attackerColor && pt == Board.Knight) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = s; } } } }
+
+            // bishops/queens (diagonals)
+            foreach (var d in BishopDeltas)
+            {
+                int t = sq + d;
+                while ((t & 0x88) == 0)
+                {
+                    if (occupiedMask[t] == 0) { t += d; continue; }
+                    var p = squares[t]; if (p == Board.Empty) { t += d; continue; }
+                    int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p;
+                    if (col == attackerColor && (pt == Board.Bishop || pt == Board.Queen)) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = t; } }
+                    break;
+                }
+            }
+
+            // rooks/queens (orthogonals)
+            foreach (var d in RookDeltas)
+            {
+                int t = sq + d;
+                while ((t & 0x88) == 0)
+                {
+                    if (occupiedMask[t] == 0) { t += d; continue; }
+                    var p = squares[t]; if (p == Board.Empty) { t += d; continue; }
+                    int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p;
+                    if (col == attackerColor && (pt == Board.Rook || pt == Board.Queen)) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = t; } }
+                    break;
+                }
+            }
+
+            // king
+            foreach (var d in KingDeltas) { int s2 = sq + d; if ((s2 & 0x88) == 0 && occupiedMask[s2] != 0) { var p = squares[s2]; if (p != Board.Empty) { int col = p > 6 ? Board.Black : Board.White; int pt = p > 6 ? p - 6 : p; if (col == attackerColor && pt == Board.King) { int v = PieceValue[pt]; if (v < bestVal) { bestVal = v; bestSq = s2; } } } } }
+
+            return bestSq;
+        }
+
+        // Static Exchange Evaluation: returns net material gain for the side to move after the capture sequence starting from from->to
+        // Positive = winning material for side who makes the initial capture (attacker side)
+        private static int StaticExchangeEvaluation(Board board, int from, int to)
+        {
+            var squares = board.Squares;
+            // occupied mask: use a stackallocated Span<byte> (0/1) to avoid heap allocations
+            Span<byte> occ = stackalloc byte[128];
+            for (int s = 0; s < 128; s++) if ((s & 0x88) == 0) occ[s] = (byte)(squares[s] != Board.Empty ? 1 : 0);
+
+            int attackerColor = (squares[from] > 6) ? Board.Black : Board.White;
+            int defenderColor = attackerColor ^ 1;
+
+            // values list: sequence of captured piece values (from perspective of attackerColor)
+            // Use stackalloc buffer to avoid allocations; maximum reasonable swap length <= 32
+            Span<int> gains = stackalloc int[32];
+            int gainsCount = 0;
+
+            // initial capture
+            int capturedPiece = squares[to];
+            int capturedVal = 0; if (capturedPiece != Board.Empty) { int pt = capturedPiece > 6 ? capturedPiece - 6 : capturedPiece; capturedVal = PieceValue[pt]; }
+            if (gainsCount < gains.Length) gains[gainsCount++] = capturedVal;
+
+            // simulate removal of attacker from 'from' and placing attacker on 'to'
+            int movingPiece = squares[from];
+            occ[from] = 0; occ[to] = 1;
+
+            int side = attackerColor;
+            int curFrom = from;
+
+            while (true)
+            {
+                // find least valuable attacker of 'to' for side^1 (opponent to capture back)
+                int opp = side ^ 1;
+                int atkSq = FindLeastValuableAttacker(board, to, opp, occ);
+                if (atkSq == -1) break;
+
+                int atkPiece = board.Squares[atkSq]; int atkPt = atkPiece > 6 ? atkPiece - 6 : atkPiece;
+                if (gainsCount < gains.Length) gains[gainsCount++] = PieceValue[atkPt];
+
+                // remove attacker from board (simulate capture)
+                occ[atkSq] = 0;
+                // now square 'to' becomes occupied by attacker
+                occ[to] = 1;
+
+                side ^= 1;
+            }
+
+            // now compute net gain sequence (minimax over swap list)
+            int n = gainsCount;
+            if (n == 0) return 0;
+            int score = gains[n - 1];
+            for (int i = n - 2; i >= 0; i--)
+            {
+                int v = gains[i] - score;
+                score = Math.Max(0, v);
+            }
+
+            // score is material gain for initial attacker side; return positive means favorable
+            return score;
         }
     }
 }
