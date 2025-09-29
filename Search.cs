@@ -19,6 +19,9 @@ namespace PromethiusEngine
         private static readonly int[,] s_killers = new int[128, 2];
         // history heuristic: map move (int) -> score
         private static readonly System.Collections.Generic.Dictionary<int, int> s_history = new System.Collections.Generic.Dictionary<int, int>();
+        private static long s_historyUpdates = 0;
+        private const int HISTORY_DECAY_THRESHOLD = 10000;
+        private const int HISTORY_MAX = 1_000_000;
         // PV from previous iterative-deepening depth: try this at root first
         private static List<Board.Move> s_lastPv = new List<Board.Move>();
         private static int s_currentRootDepth = 0;
@@ -162,7 +165,7 @@ namespace PromethiusEngine
 
         // Build a principal variation-aware negamax (returns score and PV as a list of moves).
         // This is more expensive than the pure score-only Negamax but allows printing PV.
-        private static (int score, List<Board.Move> pv) NegamaxWithPv(Board board, int depth, int alpha, int beta, bool allowNull = true)
+        private static (int score, List<Board.Move> pv) NegamaxWithPv(Board board, int depth, int alpha, int beta, int ply = 0, bool allowNull = true)
         {
             CheckStop();
 
@@ -217,7 +220,7 @@ namespace PromethiusEngine
                         board.SideToMove ^= 1;
                         try
                         {
-                            int score = -Negamax(board, depth - 1 - R, -beta, -beta + 1, false);
+                            int score = -Negamax(board, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
                             if (score >= beta)
                             {
                                 // restore
@@ -251,19 +254,19 @@ namespace PromethiusEngine
                     if (i == 0)
                     {
                         // first move: full window
-                        var child = NegamaxWithPv(board, depth - 1, -beta, -alpha, allowNull);
+                        var child = NegamaxWithPv(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
                         val = -child.score;
                         childPv = child.pv;
                     }
                     else
                     {
                         // Principal Variation Search: null-window first
-                        var child = NegamaxWithPv(board, depth - 1, -alpha - 1, -alpha, allowNull);
+                        var child = NegamaxWithPv(board, depth - 1, -alpha - 1, -alpha, ply + 1, allowNull);
                         val = -child.score;
                         // If it looks like it could be better, re-search full window
                         if (val > alpha && val < beta)
                         {
-                            var child2 = NegamaxWithPv(board, depth - 1, -beta, -alpha, allowNull);
+                            var child2 = NegamaxWithPv(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
                             val = -child2.score;
                             childPv = child2.pv;
                         }
@@ -294,16 +297,30 @@ namespace PromethiusEngine
                     bool isCapture = ((mvInt >> 17) & 1) != 0;
                     if (!isCapture)
                     {
-                        // killers: store up to 2 per ply (use depth as index)
-                        int ply = depth; if (ply < 0) ply = 0; if (ply >= 128) ply = 127;
-                        if (s_killers[ply, 0] == mvInt) { }
-                        else if (s_killers[ply, 0] == 0) s_killers[ply, 0] = mvInt;
-                        else if (s_killers[ply, 1] == 0) s_killers[ply, 1] = mvInt;
-                        else { s_killers[ply, 1] = s_killers[ply, 0]; s_killers[ply, 0] = mvInt; }
+                        // killers: store up to 2 per ply
+                        int plyIdx = ply; if (plyIdx < 0) plyIdx = 0; if (plyIdx >= 128) plyIdx = 127;
+                        if (s_killers[plyIdx, 0] == mvInt) { }
+                        else if (s_killers[plyIdx, 0] == 0) s_killers[plyIdx, 0] = mvInt;
+                        else if (s_killers[plyIdx, 1] == 0) s_killers[plyIdx, 1] = mvInt;
+                        else { s_killers[plyIdx, 1] = s_killers[plyIdx, 0]; s_killers[plyIdx, 0] = mvInt; }
 
-                        // history increment
+                        // history increment with cap and periodic decay
                         if (!s_history.TryGetValue(mvInt, out int h)) h = 0;
-                        s_history[mvInt] = h + (depth * depth);
+                        long added = (long)depth * depth;
+                        long newVal = (long)h + added;
+                        if (newVal > HISTORY_MAX) newVal = HISTORY_MAX;
+                        s_history[mvInt] = (int)newVal;
+                        s_historyUpdates++;
+                        if ((s_historyUpdates % HISTORY_DECAY_THRESHOLD) == 0)
+                        {
+                            // decay all history values by half and remove zeros
+                            var keys = new List<int>(s_history.Keys);
+                            foreach (var k in keys)
+                            {
+                                int v = s_history[k] >> 1;
+                                if (v <= 0) s_history.Remove(k); else s_history[k] = v;
+                            }
+                        }
                     }
 
                     // store to transposition table as lower bound
@@ -387,7 +404,7 @@ namespace PromethiusEngine
 
         // Negamax with alpha-beta pruning: returns score from the perspective of side-to-move.
         // alpha and beta are window bounds (inclusive/exclusive) in centipawns.
-        private static int Negamax(Board board, int depth, int alpha, int beta, bool allowNull = true)
+        private static int Negamax(Board board, int depth, int alpha, int beta, int ply = 0, bool allowNull = true)
         {
             CheckStop();
 
@@ -430,16 +447,16 @@ namespace PromethiusEngine
                     if (i == 0)
                     {
                         // first move: full window
-                        val = -Negamax(board, depth - 1, -beta, -alpha, allowNull);
+                        val = -Negamax(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
                     }
                     else
                     {
                         // null-window search first
-                        val = -Negamax(board, depth - 1, -alpha - 1, -alpha, allowNull);
+                        val = -Negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1, allowNull);
                         if (val > alpha && val < beta)
                         {
                             // re-search full window
-                            val = -Negamax(board, depth - 1, -beta, -alpha, allowNull);
+                            val = -Negamax(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
                         }
                     }
                 }
@@ -458,11 +475,11 @@ namespace PromethiusEngine
                     bool isCapture = ((mvInt >> 17) & 1) != 0;
                     if (!isCapture)
                     {
-                        int ply = depth; if (ply < 0) ply = 0; if (ply >= 128) ply = 127;
-                        if (s_killers[ply, 0] == mvInt) { }
-                        else if (s_killers[ply, 0] == 0) s_killers[ply, 0] = mvInt;
-                        else if (s_killers[ply, 1] == 0) s_killers[ply, 1] = mvInt;
-                        else { s_killers[ply, 1] = s_killers[ply, 0]; s_killers[ply, 0] = mvInt; }
+                        int plyIdx2 = depth; if (plyIdx2 < 0) plyIdx2 = 0; if (plyIdx2 >= 128) plyIdx2 = 127;
+                        if (s_killers[plyIdx2, 0] == mvInt) { }
+                        else if (s_killers[plyIdx2, 0] == 0) s_killers[plyIdx2, 0] = mvInt;
+                        else if (s_killers[plyIdx2, 1] == 0) s_killers[plyIdx2, 1] = mvInt;
+                        else { s_killers[plyIdx2, 1] = s_killers[plyIdx2, 0]; s_killers[plyIdx2, 0] = mvInt; }
 
                         if (!s_history.TryGetValue(mvInt, out int h)) h = 0;
                         s_history[mvInt] = h + (depth * depth);
