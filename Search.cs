@@ -189,12 +189,33 @@ namespace PromethiusEngine
                 Board.Move mv = ordered[i].move;
                 board.MakeMoveWithUndo(mv, out var undo);
                 int val;
-                List<Board.Move> childPv;
+                List<Board.Move>? childPv = null;
                 try
                 {
-                    var child = NegamaxWithPv(board, depth - 1, -beta, -alpha);
-                    val = -child.score;
-                    childPv = child.pv;
+                    if (i == 0)
+                    {
+                        // first move: full window
+                        var child = NegamaxWithPv(board, depth - 1, -beta, -alpha);
+                        val = -child.score;
+                        childPv = child.pv;
+                    }
+                    else
+                    {
+                        // Principal Variation Search: null-window first
+                        var child = NegamaxWithPv(board, depth - 1, -alpha - 1, -alpha);
+                        val = -child.score;
+                        // If it looks like it could be better, re-search full window
+                        if (val > alpha && val < beta)
+                        {
+                            var child2 = NegamaxWithPv(board, depth - 1, -beta, -alpha);
+                            val = -child2.score;
+                            childPv = child2.pv;
+                        }
+                        else
+                        {
+                            childPv = child.pv;
+                        }
+                    }
                 }
                 finally
                 {
@@ -352,8 +373,21 @@ namespace PromethiusEngine
                 int val;
                 try
                 {
-                    // Negate and swap alpha/beta for the child node (negamax transformation)
-                    val = -Negamax(board, depth - 1, -beta, -alpha);
+                    if (i == 0)
+                    {
+                        // first move: full window
+                        val = -Negamax(board, depth - 1, -beta, -alpha);
+                    }
+                    else
+                    {
+                        // null-window search first
+                        val = -Negamax(board, depth - 1, -alpha - 1, -alpha);
+                        if (val > alpha && val < beta)
+                        {
+                            // re-search full window
+                            val = -Negamax(board, depth - 1, -beta, -alpha);
+                        }
+                    }
                 }
                 finally
                 {
