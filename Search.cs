@@ -246,33 +246,67 @@ namespace PromethiusEngine
                 CheckStop();
 
                 Board.Move mv = ordered[i].move;
+                int mvIntLocal = (int)mv;
                 board.MakeMoveWithUndo(mv, out var undo);
                 int val;
                 List<Board.Move>? childPv = null;
                 try
                 {
-                    if (i == 0)
+                    // Detect quiet moves: not capture, not promotion
+                    bool isCaptureLocal = ((mvIntLocal >> 17) & 1) != 0;
+                    int promoLocal = (mvIntLocal >> 14) & 7;
+
+                    // detect if move gives check (after making the move, side to move is opponent)
+                    bool givesCheck = MoveGenerator.IsInCheck(board);
+
+                    // Late Move Reduction: apply to late, quiet, non-check moves
+                    if (i >= 4 && depth >= 3 && !isCaptureLocal && promoLocal == 0 && !givesCheck && mvIntLocal != ttMoveInt)
                     {
-                        // first move: full window
-                        var child = NegamaxWithPv(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
-                        val = -child.score;
-                        childPv = child.pv;
-                    }
-                    else
-                    {
-                        // Principal Variation Search: null-window first
-                        var child = NegamaxWithPv(board, depth - 1, -alpha - 1, -alpha, ply + 1, allowNull);
-                        val = -child.score;
-                        // If it looks like it could be better, re-search full window
+                        // conservative reduction: 1 ply, or 2 plies for larger depths
+                        int reduction = (depth >= 6) ? 2 : 1;
+                        int reducedChildDepth = Math.Max(0, depth - 1 - reduction);
+
+                        // null-window reduced search first
+                        var childReduced = NegamaxWithPv(board, reducedChildDepth, -alpha - 1, -alpha, ply + 1, allowNull);
+                        val = -childReduced.score;
+
+                        // if reduced search suggests improvement, re-search full window at depth-1
                         if (val > alpha && val < beta)
                         {
-                            var child2 = NegamaxWithPv(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
-                            val = -child2.score;
-                            childPv = child2.pv;
+                            var childFull = NegamaxWithPv(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
+                            val = -childFull.score;
+                            childPv = childFull.pv;
                         }
                         else
                         {
+                            childPv = childReduced.pv;
+                        }
+                    }
+                    else
+                    {
+                        if (i == 0)
+                        {
+                            // first move: full window
+                            var child = NegamaxWithPv(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
+                            val = -child.score;
                             childPv = child.pv;
+                        }
+                        else
+                        {
+                            // Principal Variation Search: null-window first
+                            var child = NegamaxWithPv(board, depth - 1, -alpha - 1, -alpha, ply + 1, allowNull);
+                            val = -child.score;
+                            // If it looks like it could be better, re-search full window
+                            if (val > alpha && val < beta)
+                            {
+                                var child2 = NegamaxWithPv(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
+                                val = -child2.score;
+                                childPv = child2.pv;
+                            }
+                            else
+                            {
+                                childPv = child.pv;
+                            }
                         }
                     }
                 }
@@ -440,23 +474,46 @@ namespace PromethiusEngine
             {
                 CheckStop();
                 Board.Move mv = ordered[i].move;
+                int mvIntLocal = (int)mv;
                 board.MakeMoveWithUndo(mv, out var undo);
                 int val;
                 try
                 {
-                    if (i == 0)
+                    // Detect quiet moves
+                    bool isCaptureLocal = ((mvIntLocal >> 17) & 1) != 0;
+                    int promoLocal = (mvIntLocal >> 14) & 7;
+                    bool givesCheck = MoveGenerator.IsInCheck(board);
+
+                    if (i >= 4 && depth >= 3 && !isCaptureLocal && promoLocal == 0 && !givesCheck && mvIntLocal != ttMoveInt)
                     {
-                        // first move: full window
-                        val = -Negamax(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
+                        int reduction = (depth >= 6) ? 2 : 1;
+                        int reducedDepth = Math.Max(0, depth - 1 - reduction);
+
+                        // reduced null-window search first
+                        val = -Negamax(board, reducedDepth, -alpha - 1, -alpha, ply + 1, allowNull);
+
+                        // re-search full window if promising
+                        if (val > alpha && val < beta)
+                        {
+                            val = -Negamax(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
+                        }
                     }
                     else
                     {
-                        // null-window search first
-                        val = -Negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1, allowNull);
-                        if (val > alpha && val < beta)
+                        if (i == 0)
                         {
-                            // re-search full window
+                            // first move: full window
                             val = -Negamax(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
+                        }
+                        else
+                        {
+                            // null-window search first
+                            val = -Negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1, allowNull);
+                            if (val > alpha && val < beta)
+                            {
+                                // re-search full window
+                                val = -Negamax(board, depth - 1, -beta, -alpha, ply + 1, allowNull);
+                            }
                         }
                     }
                 }
