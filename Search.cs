@@ -40,6 +40,9 @@ namespace PromethiusEngine
         // Pruning/tuning parameters
         private const int FUTILITY_MAX_DEPTH = 3; // apply futility at shallow depths
         private const int FUTILITY_MARGIN_BASE = 100; // margin per ply (centipawns)
+                                                      // Conservative SEE margin: allow captures that lose up to this many centipawns
+                                                      // (treat slightly losing SEE as acceptable to avoid over-pruning tactical captures)
+        private const int SEE_MARGIN = 50;
 
         // Multi-cut parameters (tactical shortcut): when many quiet moves exist,
         // try several reduced, null-window searches on the first few moves. If
@@ -455,7 +458,8 @@ namespace PromethiusEngine
                     score += 600000 + mvvScore;
                     // Static Exchange Evaluation: if this capture loses material overall, demote it
                     int see = StaticExchangeEvaluation(board, from, to);
-                    if (see < 0) score -= 400000; // demote losing captures
+                    // Demote only clearly losing captures; allow slightly negative SEE (conservative)
+                    if (see < -SEE_MARGIN) score -= 400000; // demote losing captures
                 }
                 // killer moves
                 for (int k = 0; k < 2; k++) if (s_killers[depth < 128 ? depth : 127, k] == mvInt) score += 200000;
@@ -698,6 +702,27 @@ namespace PromethiusEngine
             var caps = MoveGenerator.GenerateCaptures(board);
             if (caps == null || caps.Count == 0) return standPat;
 
+            // Delta pruning: compute largest victim value among captures at this node
+            int maxCaptureValue = 0;
+            for (int ci = 0; ci < caps.Count; ci++)
+            {
+                var m = caps[ci];
+                int toSq = Board.Move.GetTo(m);
+                var vict = board.Squares[toSq];
+                if (vict != Board.Empty)
+                {
+                    int vtype = vict > 6 ? vict - 6 : vict;
+                    if (vtype >= 1 && vtype <= 6)
+                    {
+                        int val = PieceValue[vtype];
+                        if (val > maxCaptureValue) maxCaptureValue = val;
+                    }
+                }
+            }
+
+            // If even the largest capture cannot raise standPat to alpha (conservatively), quit
+            if (standPat + maxCaptureValue + SEE_MARGIN < alpha) return standPat;
+
             // Order captures using MVV-LVA via OrderMoves
             Span<Board.Move> capSpan = caps.Count > 0 ? CollectionsMarshal.AsSpan(caps) : Span<Board.Move>.Empty;
             var orderedCaps = OrderMoves(capSpan, board, 0, 0);
@@ -711,7 +736,14 @@ namespace PromethiusEngine
                 int from = Board.Move.GetFrom(mv);
                 int to = Board.Move.GetTo(mv);
                 int seeVal = StaticExchangeEvaluation(board, from, to);
-                if (seeVal + alpha < 0) continue; // likely losing capture -> skip
+                // Use a conservative margin: allow captures that lose up to SEE_MARGIN centipawns
+                if (seeVal + SEE_MARGIN + alpha < 0) continue; // likely losing capture -> skip
+
+                // Delta pruning: skip captures whose stand-pat plus captured piece value cannot reach alpha
+                var victimPiece = board.Squares[to];
+                int victimVal = 0;
+                if (victimPiece != Board.Empty) { int vpt = victimPiece > 6 ? victimPiece - 6 : victimPiece; victimVal = PieceValue[vpt]; }
+                if (standPat + victimVal + SEE_MARGIN < alpha) continue; // cannot improve
 
                 // make move
                 board.MakeMoveWithUndo(mv, out var undo);
