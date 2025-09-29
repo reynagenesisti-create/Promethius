@@ -31,6 +31,22 @@ namespace PromethiusEngine
         // piece values for SEE / ordering (centipawns)
         private static readonly int[] PieceValue = { 0, 100, 320, 330, 500, 900, 20000 };
 
+        // MVV-LVA table: victim (1..6) x attacker (1..6) -> score
+        private static readonly int[,] MvvLva = new int[7, 7];
+
+        static Search()
+        {
+            // fill MVV-LVA: higher victim value and lower attacker value -> higher score
+            for (int v = 1; v <= 6; v++)
+            {
+                for (int a = 1; a <= 6; a++)
+                {
+                    // base: victim value * 10 - attacker value
+                    MvvLva[v, a] = PieceValue[v] * 10 - PieceValue[a];
+                }
+            }
+        }
+
         // 0x88 deltas for attack detection
         private static readonly int[] KnightDeltas = { 0x21, 0x1f, 0x12, 0x0e, -0x21, -0x1f, -0x12, -0x0e };
         private static readonly int[] KingDeltas = { 0x10, 0x11, 0x01, -0x0f, -0x10, -0x11, -0x01, 0x0f };
@@ -146,7 +162,7 @@ namespace PromethiusEngine
 
         // Build a principal variation-aware negamax (returns score and PV as a list of moves).
         // This is more expensive than the pure score-only Negamax but allows printing PV.
-        private static (int score, List<Board.Move> pv) NegamaxWithPv(Board board, int depth, int alpha, int beta)
+        private static (int score, List<Board.Move> pv) NegamaxWithPv(Board board, int depth, int alpha, int beta, bool allowNull = true)
         {
             CheckStop();
 
@@ -163,9 +179,9 @@ namespace PromethiusEngine
             Span<Board.Move> moves = stackalloc Board.Move[218];
             MoveGenerator.GenerateMovesSpan(board, moves, out int movesCount);
 
-            // probe transposition table for best move to try first
+            // probe transposition table for best move to try first (only when allowed)
             int ttMoveInt = 0;
-            if (TranspositionTable.Probe(board.ZobristKey, out int ttValue, out int ttDepth, out int ttMove, out byte ttFlags))
+            if (allowNull && TranspositionTable.Probe(board.ZobristKey, out int ttValue, out int ttDepth, out int ttMove, out byte ttFlags))
             {
                 ttMoveInt = ttMove;
             }
@@ -177,6 +193,46 @@ namespace PromethiusEngine
             {
                 if (MoveGenerator.IsInCheckmate(board)) return (-MATE_SCORE - depth, new List<Board.Move>());
                 return (0, new List<Board.Move>());
+            }
+
+            // Null-move pruning: do a null-move test if allowed, not in check, and depth sufficiently large
+            if (allowNull && depth >= 3)
+            {
+                // check not in check
+                int kingSq = board.SideToMove == Board.White ? board.WhiteKingSquare : board.BlackKingSquare;
+                int opp = board.SideToMove ^ 1;
+                if (!IsSquareAttackedBy(board, kingSq, opp))
+                {
+                    // quick material check: skip null-move in low-material positions
+                    int mat = 0;
+                    var sqs = board.Squares;
+                    for (int s = 0; s < 128; s++) if ((s & 0x88) == 0) { var p = sqs[s]; if (p != Board.Empty) { int pt = p > 6 ? p - 6 : p; if (pt != Board.King) mat += PieceValue[pt]; } }
+                    if (mat >= 800) // adaptive threshold
+                    {
+                        int R = 2; // reduction
+                        // perform null move: save minimal state
+                        int savedEp = board.EnPassant;
+                        int savedSide = board.SideToMove;
+                        board.EnPassant = -1;
+                        board.SideToMove ^= 1;
+                        try
+                        {
+                            int score = -Negamax(board, depth - 1 - R, -beta, -beta + 1, false);
+                            if (score >= beta)
+                            {
+                                // restore
+                                board.SideToMove = savedSide;
+                                board.EnPassant = savedEp;
+                                return (score, new List<Board.Move>());
+                            }
+                        }
+                        finally
+                        {
+                            board.SideToMove = savedSide;
+                            board.EnPassant = savedEp;
+                        }
+                    }
+                }
             }
 
             int best = int.MinValue + 1024;
@@ -195,19 +251,19 @@ namespace PromethiusEngine
                     if (i == 0)
                     {
                         // first move: full window
-                        var child = NegamaxWithPv(board, depth - 1, -beta, -alpha);
+                        var child = NegamaxWithPv(board, depth - 1, -beta, -alpha, allowNull);
                         val = -child.score;
                         childPv = child.pv;
                     }
                     else
                     {
                         // Principal Variation Search: null-window first
-                        var child = NegamaxWithPv(board, depth - 1, -alpha - 1, -alpha);
+                        var child = NegamaxWithPv(board, depth - 1, -alpha - 1, -alpha, allowNull);
                         val = -child.score;
                         // If it looks like it could be better, re-search full window
                         if (val > alpha && val < beta)
                         {
-                            var child2 = NegamaxWithPv(board, depth - 1, -beta, -alpha);
+                            var child2 = NegamaxWithPv(board, depth - 1, -beta, -alpha, allowNull);
                             val = -child2.score;
                             childPv = child2.pv;
                         }
@@ -284,11 +340,9 @@ namespace PromethiusEngine
                     sbyte att = board.Squares[from];
                     int victType = vict == Board.Empty ? 0 : (vict > 6 ? vict - 6 : vict);
                     int attType = att == Board.Empty ? 0 : (att > 6 ? att - 6 : att);
-                    int VictVal = 0; int AttVal = 0;
-                    switch (victType) { case Board.Pawn: VictVal = 100; break; case Board.Knight: VictVal = 320; break; case Board.Bishop: VictVal = 330; break; case Board.Rook: VictVal = 500; break; case Board.Queen: VictVal = 900; break; case Board.King: VictVal = 20000; break; }
-                    switch (attType) { case Board.Pawn: AttVal = 100; break; case Board.Knight: AttVal = 320; break; case Board.Bishop: AttVal = 330; break; case Board.Rook: AttVal = 500; break; case Board.Queen: AttVal = 900; break; case Board.King: AttVal = 20000; break; }
-                    // MVV-LVA style: prefer capturing more valuable victim with less valuable attacker
-                    score += 600000 + (VictVal * 10 - AttVal);
+                    // MVV-LVA table lookup (victim, attacker)
+                    int mvvScore = (victType >= 1 && attType >= 1) ? MvvLva[victType, attType] : 0;
+                    score += 600000 + mvvScore;
                     // Static Exchange Evaluation: if this capture loses material overall, demote it
                     int see = StaticExchangeEvaluation(board, from, to);
                     if (see < 0) score -= 400000; // demote losing captures
@@ -333,7 +387,7 @@ namespace PromethiusEngine
 
         // Negamax with alpha-beta pruning: returns score from the perspective of side-to-move.
         // alpha and beta are window bounds (inclusive/exclusive) in centipawns.
-        private static int Negamax(Board board, int depth, int alpha, int beta)
+        private static int Negamax(Board board, int depth, int alpha, int beta, bool allowNull = true)
         {
             CheckStop();
 
@@ -376,16 +430,16 @@ namespace PromethiusEngine
                     if (i == 0)
                     {
                         // first move: full window
-                        val = -Negamax(board, depth - 1, -beta, -alpha);
+                        val = -Negamax(board, depth - 1, -beta, -alpha, allowNull);
                     }
                     else
                     {
                         // null-window search first
-                        val = -Negamax(board, depth - 1, -alpha - 1, -alpha);
+                        val = -Negamax(board, depth - 1, -alpha - 1, -alpha, allowNull);
                         if (val > alpha && val < beta)
                         {
                             // re-search full window
-                            val = -Negamax(board, depth - 1, -beta, -alpha);
+                            val = -Negamax(board, depth - 1, -beta, -alpha, allowNull);
                         }
                     }
                 }

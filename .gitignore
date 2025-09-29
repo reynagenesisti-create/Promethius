@@ -31,3 +31,4 @@ publish/
 
 # Ignore the opening book games in release folder if present
 bin/Release/**/Games.txt
+*todo
