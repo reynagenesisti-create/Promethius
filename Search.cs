@@ -698,31 +698,52 @@ namespace PromethiusEngine
             if (standPat >= beta) return beta;
             if (standPat > alpha) alpha = standPat;
 
-            // Generate only captures/promotions to extend the search
-            var caps = MoveGenerator.GenerateCaptures(board);
-            if (caps == null || caps.Count == 0) return standPat;
-
-            // Delta pruning: compute largest victim value among captures at this node
-            int maxCaptureValue = 0;
-            for (int ci = 0; ci < caps.Count; ci++)
+            // If in check, generate evasions (all legal moves that remove the check) and search them.
+            List<Board.Move> caps;
+            bool inCheck = MoveGenerator.IsInCheck(board);
+            if (inCheck)
             {
-                var m = caps[ci];
-                int toSq = Board.Move.GetTo(m);
-                var vict = board.Squares[toSq];
-                if (vict != Board.Empty)
+                // build evasions by generating all legal moves and keeping those that leave king safe
+                Span<Board.Move> all = stackalloc Board.Move[218];
+                MoveGenerator.GenerateMovesSpan(board, all, out int allCount);
+                caps = new List<Board.Move>(allCount);
+                for (int i = 0; i < allCount; i++)
                 {
-                    int vtype = vict > 6 ? vict - 6 : vict;
-                    if (vtype >= 1 && vtype <= 6)
+                    var mv = all[i];
+                    board.MakeMoveWithUndo(mv, out var undo);
+                    bool kingSafe = !MoveGenerator.IsInCheck(board);
+                    board.UnmakeMove(mv, undo);
+                    if (kingSafe) caps.Add(mv);
+                }
+                if (caps.Count == 0) return EvaluateLeafTerminal(board, 0);
+            }
+            else
+            {
+                // Generate only captures/promotions to extend the search
+                caps = MoveGenerator.GenerateCaptures(board);
+                if (caps == null || caps.Count == 0) return standPat;
+
+                // Delta pruning: compute largest victim value among captures at this node
+                int maxCaptureValue = 0;
+                for (int ci = 0; ci < caps.Count; ci++)
+                {
+                    var m = caps[ci];
+                    int toSq = Board.Move.GetTo(m);
+                    var vict = board.Squares[toSq];
+                    if (vict != Board.Empty)
                     {
-                        int val = PieceValue[vtype];
-                        if (val > maxCaptureValue) maxCaptureValue = val;
+                        int vtype = vict > 6 ? vict - 6 : vict;
+                        if (vtype >= 1 && vtype <= 6)
+                        {
+                            int val = PieceValue[vtype];
+                            if (val > maxCaptureValue) maxCaptureValue = val;
+                        }
                     }
                 }
+
+                // If even the largest capture cannot raise standPat to alpha (conservatively), quit
+                if (standPat + maxCaptureValue + SEE_MARGIN < alpha) return standPat;
             }
-
-            // If even the largest capture cannot raise standPat to alpha (conservatively), quit
-            if (standPat + maxCaptureValue + SEE_MARGIN < alpha) return standPat;
-
             // Order captures using MVV-LVA via OrderMoves
             Span<Board.Move> capSpan = caps.Count > 0 ? CollectionsMarshal.AsSpan(caps) : Span<Board.Move>.Empty;
             var orderedCaps = OrderMoves(capSpan, board, 0, 0);
@@ -732,18 +753,22 @@ namespace PromethiusEngine
 
                 Board.Move mv = orderedCaps[i].move;
 
-                // Quick SEE filter: skip obviously bad recaptures
+                // If not an evasion (i.e., we were not in check), apply SEE quick-filter and delta pruning
                 int from = Board.Move.GetFrom(mv);
                 int to = Board.Move.GetTo(mv);
-                int seeVal = StaticExchangeEvaluation(board, from, to);
-                // Use a conservative margin: allow captures that lose up to SEE_MARGIN centipawns
-                if (seeVal + SEE_MARGIN + alpha < 0) continue; // likely losing capture -> skip
+                if (!inCheck)
+                {
+                    // Quick SEE filter: skip obviously bad recaptures
+                    int seeVal = StaticExchangeEvaluation(board, from, to);
+                    // Use a conservative margin: allow captures that lose up to SEE_MARGIN centipawns
+                    if (seeVal + SEE_MARGIN + alpha < 0) continue; // likely losing capture -> skip
 
-                // Delta pruning: skip captures whose stand-pat plus captured piece value cannot reach alpha
-                var victimPiece = board.Squares[to];
-                int victimVal = 0;
-                if (victimPiece != Board.Empty) { int vpt = victimPiece > 6 ? victimPiece - 6 : victimPiece; victimVal = PieceValue[vpt]; }
-                if (standPat + victimVal + SEE_MARGIN < alpha) continue; // cannot improve
+                    // Delta pruning: skip captures whose stand-pat plus captured piece value cannot reach alpha
+                    var victimPiece = board.Squares[to];
+                    int victimVal = 0;
+                    if (victimPiece != Board.Empty) { int vpt = victimPiece > 6 ? victimPiece - 6 : victimPiece; victimVal = PieceValue[vpt]; }
+                    if (standPat + victimVal + SEE_MARGIN < alpha) continue; // cannot improve
+                }
 
                 // make move
                 board.MakeMoveWithUndo(mv, out var undo);
